@@ -22,7 +22,10 @@ import {
   BatchPredictionResultDto,
   BatchSubmitResponseDto,
 } from './dto/batch-submit-response.dto';
-import { UpdatePredictionNoteDto } from './dto/update-prediction-note.dto';
+import {
+  UpdatePredictionNoteDto,
+  sanitizeNote,
+} from './dto/update-prediction-note.dto';
 import {
   ListMarketPredictionsDto,
   MarketPredictionResponseDto,
@@ -712,7 +715,7 @@ export class PredictionsService {
       throw new PredictionNotFoundException(predictionId);
     }
 
-    prediction.note = dto.note;
+    prediction.note = sanitizeNote(dto.note);
     return this.predictionsRepository.save(prediction);
   }
 
