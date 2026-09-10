@@ -42,6 +42,10 @@ import { Comment } from './entities/comment.entity';
 import { moderateCommentContent } from '../common/comment-moderation.util';
 import { MarketTemplate } from './entities/market-template.entity';
 import { Market, MarketSettlementState } from './entities/market.entity';
+import {
+  canTransition,
+  describeIllegalTransition,
+} from './market-settlement-state.util';
 import { UserBookmark } from './entities/user-bookmark.entity';
 import { MarketPriceSnapshot } from './entities/market-price-snapshot.entity';
 import { Prediction } from '../predictions/entities/prediction.entity';
@@ -564,9 +568,14 @@ export class MarketsService {
       throw new ConflictException('Market is already resolved');
     }
 
-    if (market.settlement_state !== MarketSettlementState.PENDING) {
+    if (
+      !canTransition(market.settlement_state, MarketSettlementState.PROPOSED)
+    ) {
       throw new ConflictException(
-        `Cannot propose a resolution while market is in "${market.settlement_state}" state`,
+        describeIllegalTransition(
+          market.settlement_state,
+          MarketSettlementState.PROPOSED,
+        ),
       );
     }
 
@@ -616,9 +625,15 @@ export class MarketsService {
   ): Promise<Market> {
     const market = await this.findByIdOrOnChainId(id);
 
-    if (market.settlement_state !== MarketSettlementState.PROPOSED) {
+    if (
+      !canTransition(market.settlement_state, MarketSettlementState.CHALLENGED)
+    ) {
       throw new BadRequestException(
-        'Market does not have a resolution pending challenge',
+        'Market does not have a resolution pending challenge: ' +
+          describeIllegalTransition(
+            market.settlement_state,
+            MarketSettlementState.CHALLENGED,
+          ),
       );
     }
 
@@ -661,7 +676,11 @@ export class MarketsService {
     const market = await this.findByIdOrOnChainId(id);
 
     if (market.settlement_state !== MarketSettlementState.CHALLENGED) {
-      throw new BadRequestException('Market does not have an active challenge');
+      // Narrower than the transition table on purpose: SETTLING may legally
+      // reach SETTLED, but only via the scheduler, never via adjudication.
+      throw new BadRequestException(
+        `Market does not have an active challenge (state: "${market.settlement_state}")`,
+      );
     }
 
     if (!market.outcome_options.includes(dto.outcome)) {
