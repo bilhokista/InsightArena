@@ -3,6 +3,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, QueryRunner, Repository } from 'typeorm';
 import { Market, MarketSettlementState } from './entities/market.entity';
+import { canTransition } from './market-settlement-state.util';
 import {
   SettlementAttempt,
   SettlementAttemptStatus,
@@ -229,10 +230,11 @@ export class MarketSettlementScheduler {
       const fresh = await queryRunner.manager.findOne(Market, {
         where: { id: market.id },
       });
+      // Asks the transition table rather than re-listing the states here, so
+      // this predicate cannot drift from the rules the service enforces.
       const stillEligible =
         fresh &&
-        (fresh.settlement_state === MarketSettlementState.PROPOSED ||
-          fresh.settlement_state === MarketSettlementState.SETTLING) &&
+        canTransition(fresh.settlement_state, MarketSettlementState.SETTLING) &&
         !!fresh.proposed_outcome;
 
       if (!stillEligible) {
