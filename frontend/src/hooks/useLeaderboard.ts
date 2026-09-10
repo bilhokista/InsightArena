@@ -10,6 +10,12 @@ import {
   type SnapshotRankingEntry,
 } from "@/lib/api";
 import { logHookError } from "@/hooks/useHookErrorMessage";
+import {
+  LEADERBOARD_PAGE_SIZE,
+  hasMorePages,
+  mergeLeaderboardPages,
+  remainingCount,
+} from "@/lib/leaderboard";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,6 +35,16 @@ export interface UseLeaderboardReturn {
   error: string | null;
   /** True when the server returned zero entries (not the same as loading). */
   isEmpty: boolean;
+
+  // ── Pagination ──────────────────────────────────────────────────────────
+  /** Whether another page exists after the ones already loaded. */
+  hasMore: boolean;
+  /** True while a subsequent page is in flight; false for the first load. */
+  isLoadingMore: boolean;
+  /** Entries not yet loaded, so a tail skeleton can size itself honestly. */
+  remaining: number;
+  /** Fetches the next page and appends it. No-op when already busy or done. */
+  loadMore: () => Promise<void>;
 
   // ── Snapshot compare ────────────────────────────────────────────────────
   /** ISO date string the compare snapshot is pinned to, or null when off. */
@@ -58,7 +74,13 @@ export function useLeaderboard(): UseLeaderboardReturn {
   const [seasons, setSeasons] = useState<SeasonListItem[]>([]);
   const [seasonId, setSeasonIdState] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pageInfo, setPageInfo] = useState({
+    page: 1,
+    limit: LEADERBOARD_PAGE_SIZE,
+    total: 0,
+  });
 
   const [compareDate, setCompareDateState] = useState<string | null>(null);
   const [snapshotEntries, setSnapshotEntries] = useState<SnapshotRankingEntry[]>([]);
@@ -73,6 +95,11 @@ export function useLeaderboard(): UseLeaderboardReturn {
   const abortRef = useRef<AbortController | null>(null);
   const snapshotAbortRef = useRef<AbortController | null>(null);
 
+  // Separate from `abortRef`: cancelling a "load more" must not tear down the
+  // first-page request, and changing season must cancel both.
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
+  const isLoadingMoreRef = useRef(false);
+
   // Keep a ref to the live entries so fetchSnapshot can read the latest value
   // without needing entries in its dependency array (avoids re-creating the
   // callback on every render).
@@ -80,6 +107,19 @@ export function useLeaderboard(): UseLeaderboardReturn {
   useEffect(() => {
     entriesRef.current = entries;
   }, [entries]);
+
+  // Same trick for the values `loadMore` needs: keeping them in refs lets the
+  // callback stay referentially stable, which matters because useInfiniteScroll
+  // rebuilds its IntersectionObserver whenever the callback identity changes.
+  const pageInfoRef = useRef(pageInfo);
+  useEffect(() => {
+    pageInfoRef.current = pageInfo;
+  }, [pageInfo]);
+
+  const seasonIdRef = useRef(seasonId);
+  useEffect(() => {
+    seasonIdRef.current = seasonId;
+  }, [seasonId]);
 
   // ---------------------------------------------------------------------------
   // Load leaderboard entries + seasons list
@@ -97,17 +137,26 @@ export function useLeaderboard(): UseLeaderboardReturn {
     try {
       // Fetch leaderboard + seasons list in parallel.
       const [leaderboardData, seasonsData] = await Promise.all([
-        getLeaderboard({ season_id: sid, limit: 100 }, { signal }),
+        getLeaderboard(
+          { season_id: sid, page: 1, limit: LEADERBOARD_PAGE_SIZE },
+          { signal },
+        ),
         getSeasons({ signal }),
       ]);
 
       if (signal.aborted) return;
 
       setEntries(leaderboardData.data);
+      setPageInfo({
+        page: leaderboardData.page,
+        limit: leaderboardData.limit,
+        total: leaderboardData.total,
+      });
       setSeasons(seasonsData.data);
     } catch (err) {
       if (signal.aborted) return;
       setEntries([]);
+      setPageInfo({ page: 1, limit: LEADERBOARD_PAGE_SIZE, total: 0 });
       setError(
         logHookError(err, {
           fallbackMessage: "Failed to load leaderboard.",
@@ -121,8 +170,16 @@ export function useLeaderboard(): UseLeaderboardReturn {
 
   // Re-fetch whenever the season changes.
   useEffect(() => {
+    // A page-2 request for the previous season would append foreign rows.
+    loadMoreAbortRef.current?.abort();
+    isLoadingMoreRef.current = false;
+    setIsLoadingMore(false);
+
     fetchLeaderboard(seasonId);
-    return () => abortRef.current?.abort();
+    return () => {
+      abortRef.current?.abort();
+      loadMoreAbortRef.current?.abort();
+    };
   }, [seasonId, fetchLeaderboard]);
 
   // ---------------------------------------------------------------------------
@@ -208,6 +265,54 @@ export function useLeaderboard(): UseLeaderboardReturn {
     setCompareDateState(date);
   }, []);
 
+  const loadMore = useCallback(async () => {
+    // Guarded by a ref, not the state flag: two scroll events can fire before
+    // React re-renders, and both would otherwise fetch the same page.
+    if (isLoadingMoreRef.current) return;
+    if (!hasMorePages(pageInfoRef.current)) return;
+
+    isLoadingMoreRef.current = true;
+    setIsLoadingMore(true);
+
+    loadMoreAbortRef.current?.abort();
+    const controller = new AbortController();
+    loadMoreAbortRef.current = controller;
+    const { signal } = controller;
+
+    const nextPage = pageInfoRef.current.page + 1;
+
+    try {
+      const data = await getLeaderboard(
+        {
+          season_id: seasonIdRef.current,
+          page: nextPage,
+          limit: pageInfoRef.current.limit,
+        },
+        { signal },
+      );
+
+      if (signal.aborted) return;
+
+      // Merge rather than concatenate: the ranking is live, so a user can
+      // legitimately appear on two consecutive pages.
+      setEntries((prev) => mergeLeaderboardPages(prev, data.data));
+      setPageInfo({ page: data.page, limit: data.limit, total: data.total });
+    } catch (err) {
+      if (signal.aborted) return;
+      // The first page is still on screen and still valid, so this is
+      // reported without clearing it.
+      setError(
+        logHookError(err, {
+          fallbackMessage: "Failed to load more leaderboard entries.",
+          hookName: "useLeaderboard/loadMore",
+        }),
+      );
+    } finally {
+      isLoadingMoreRef.current = false;
+      if (!signal.aborted) setIsLoadingMore(false);
+    }
+  }, []);
+
   const refetch = useCallback(() => {
     fetchLeaderboard(seasonId);
     if (compareDate) fetchSnapshot(compareDate, seasonId);
@@ -221,6 +326,10 @@ export function useLeaderboard(): UseLeaderboardReturn {
     isLoading,
     error,
     isEmpty: !isLoading && !error && entries.length === 0,
+    hasMore: hasMorePages(pageInfo),
+    isLoadingMore,
+    remaining: remainingCount(pageInfo),
+    loadMore,
     compareDate,
     setCompareDate,
     snapshotEntries,
