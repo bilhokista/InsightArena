@@ -861,6 +861,34 @@ describe('PredictionsService', () => {
       ).rejects.toThrow(PredictionNotFoundException);
       expect(submitPrediction).not.toHaveBeenCalled();
     });
+
+    it.each([
+      ['<script>alert(1)</script>Real analysis', 'Real analysis'],
+      ['<img src=x onerror=alert(1)>note', 'note'],
+      ['<b>bold</b> and <i>italic</i>', 'bold and italic'],
+      ['<style>body{}</style>clean', 'clean'],
+      ['  padded  ', 'padded'],
+      ['plain text, unchanged', 'plain text, unchanged'],
+    ])('should sanitize %j before saving', async (input, expected) => {
+      const user = makeUser();
+      const prediction = {
+        id: 'pred-1',
+        user,
+        market: makeMarket(),
+        note: null,
+      } as unknown as Prediction;
+
+      mockPredictionsRepo.findOne.mockResolvedValue(prediction);
+      mockPredictionsRepo.save.mockImplementation(async (p) => p as Prediction);
+
+      await service.updateNote('pred-1', { note: input }, user);
+
+      // Assert on what reaches the repository, not on the return value: the
+      // sanitised text is what actually gets stored.
+      expect(mockPredictionsRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ note: expected }),
+      );
+    });
   });
 
   describe('findById', () => {
