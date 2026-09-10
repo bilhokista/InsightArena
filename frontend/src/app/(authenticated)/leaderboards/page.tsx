@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Trophy, Medal, Award, GitCompare, X } from "lucide-react";
 import LeaderboardOverview from "@/component/leaderboard/LeaderboardOverview";
 import LeaderboardFilters from "@/component/leaderboard/LeaderboardFilters";
@@ -9,6 +9,8 @@ import LeaderboardTable, {
   RankDelta,
 } from "@/component/leaderboard/LeaderboardTable";
 import { useLeaderboard } from "@/hooks/useLeaderboard";
+import { useInfiniteScroll } from "@/hooks/useInfiniteScroll";
+import { Skeleton } from "@/component/ui/skeleton";
 import type { LeaderboardEntryResponse } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
@@ -269,9 +271,27 @@ export default function LeaderboardsPage() {
     snapshotDeltas,
     isSnapshotLoading,
     snapshotError,
+    hasMore,
+    isLoadingMore,
+    remaining,
+    loadMore,
   } = useLeaderboard();
 
   const [showCompare, setShowCompare] = useState(false);
+
+  const { observerTarget, setHasMore } = useInfiniteScroll({
+    onLoadMore: loadMore,
+    // Held off during the first load so the sentinel, which sits in an empty
+    // list and is therefore on screen, cannot request page 2 before page 1
+    // has arrived.
+    enabled: !isLoading && !error,
+  });
+
+  // The hook owns `hasMore` as its own state; keep it in step with what the
+  // server actually reported.
+  useEffect(() => {
+    setHasMore(hasMore);
+  }, [hasMore, setHasMore]);
 
   // Derive the display name for the currently selected season.
   const selectedSeason = seasons.find((s) => s.id === seasonId);
@@ -369,6 +389,31 @@ export default function LeaderboardsPage() {
           isLoading={isLoading}
           showDelta={showCompare && snapshotDeltas.size > 0}
         />
+
+        {/* Tail skeleton — sized to what is genuinely left, so the list does
+            not promise more rows than the server has. */}
+        {isLoadingMore && (
+          <div className="space-y-2" aria-hidden="true" data-testid="leaderboard-tail-skeleton">
+            {Array.from({ length: Math.min(remaining, 5) }).map((_, i) => (
+              <Skeleton key={i} className="h-12 w-full rounded-xl" />
+            ))}
+          </div>
+        )}
+
+        {/* Sentinel the observer watches. Rendered only while more remains, so
+            a finished list stops asking. */}
+        {hasMore && !isLoading && (
+          <div ref={observerTarget} className="h-px w-full" aria-hidden="true" />
+        )}
+
+        <p className="sr-only" role="status">
+          {isLoadingMore
+            ? "Loading more leaderboard entries"
+            : hasMore
+              ? `${remaining} more entries available`
+              : "All leaderboard entries loaded"}
+        </p>
+
         {isEmpty && !isLoading && (
           <p className="text-center text-sm text-gray-500 py-4">
             No leaderboard data for this season yet.
