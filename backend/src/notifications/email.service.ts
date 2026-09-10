@@ -14,6 +14,10 @@ import {
   NotificationCategory,
 } from './entities/notification-category-preference.entity';
 import {
+  DeadLetteredEmail,
+  DeadLetterReason,
+} from './entities/dead-lettered-email.entity';
+import {
   EmailTemplateContext,
   EmailTemplateType,
   renderEmailTemplate,
@@ -29,6 +33,34 @@ export interface QueuedEmail {
   userAddress?: string;
   queuedAt: number;
 }
+
+/**
+ * Raised by {@link EmailService.deliverEmailWithRetry} once it gives up, so
+ * the caller can dead-letter the message with the two facts it needs — how
+ * many attempts were spent, and whether the provider gave a verdict — instead
+ * of re-deriving them from the underlying error.
+ */
+export class EmailDeliveryFailure extends Error {
+  constructor(
+    readonly reason: DeadLetterReason,
+    readonly attempts: number,
+    readonly cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'EmailDeliveryFailure';
+  }
+}
+
+/** Cumulative delivery counters since process start. */
+export interface EmailDeliveryCounters {
+  sent: number;
+  /** Individual retry attempts, not messages — one message can add several. */
+  retried: number;
+  deadLettered: number;
+}
+
+/** Column width of `failure_message`; longer messages are truncated to fit. */
+const MAX_FAILURE_MESSAGE_LENGTH = 1000;
 
 const DEFAULT_RATE_LIMIT = 30;
 const QUEUE_PROCESS_INTERVAL_MS = 2000;
@@ -157,6 +189,11 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
   private readonly sentTimestamps: number[] = [];
   private processTimer: ReturnType<typeof setInterval> | null = null;
   private isProcessing = false;
+  private readonly counters: EmailDeliveryCounters = {
+    sent: 0,
+    retried: 0,
+    deadLettered: 0,
+  };
 
   constructor(
     private readonly configService: ConfigService,
@@ -166,7 +203,17 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
     private readonly preferencesRepository: Repository<UserPreferences>,
     @InjectRepository(NotificationCategoryPreference)
     private readonly categoryPreferencesRepository: Repository<NotificationCategoryPreference>,
+    @InjectRepository(DeadLetteredEmail)
+    private readonly deadLetterRepository: Repository<DeadLetteredEmail>,
   ) {}
+
+  /**
+   * Snapshot of the delivery counters, for a metrics endpoint or a health
+   * probe. Returns a copy so a caller cannot mutate the running totals.
+   */
+  getDeliveryCounters(): EmailDeliveryCounters {
+    return { ...this.counters };
+  }
 
   onModuleInit(): void {
     this.processTimer = setInterval(() => {
@@ -313,18 +360,26 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
 
     this.isProcessing = true;
 
+    let email: QueuedEmail | undefined;
     try {
-      const email = this.queue.shift();
+      email = this.queue.shift();
       if (!email) {
         return;
       }
 
       await this.deliverEmailWithRetry(email);
       this.sentTimestamps.push(Date.now());
+      this.counters.sent += 1;
     } catch (error) {
-      this.logger.error(
-        `Failed to process email queue: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
+      // The message was already shifted off the queue, so unless it is
+      // persisted here it is gone for good.
+      if (email) {
+        await this.deadLetter(email, error);
+      } else {
+        this.logger.error(
+          `Failed to process email queue: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        );
+      }
     } finally {
       this.isProcessing = false;
     }
@@ -375,7 +430,11 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
             `Permanent email failure for message ${email.id} (attempt ${attempt + 1}/${maxAttempts}): ` +
               `${error instanceof Error ? error.message : String(error)}`,
           );
-          throw error;
+          throw new EmailDeliveryFailure(
+            DeadLetterReason.PERMANENT,
+            attempt + 1,
+            error,
+          );
         }
 
         const attemptsRemaining = maxAttempts - attempt - 1;
@@ -384,6 +443,7 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
           break; // exhausted — log final error below
         }
 
+        this.counters.retried += 1;
         const delayMs = computeBackoffDelay(baseDelayMs, attempt);
         this.logger.warn(
           `Transient email failure for message ${email.id} — attempt ${attempt + 1}/${maxAttempts}, ` +
@@ -399,7 +459,55 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
       `Email delivery failed after ${maxAttempts} attempt(s) for message ${email.id} — ` +
         `final error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
     );
-    throw lastError;
+    throw new EmailDeliveryFailure(
+      DeadLetterReason.RETRIES_EXHAUSTED,
+      maxAttempts,
+      lastError,
+    );
+  }
+
+  /**
+   * Persist a message that will not be delivered, with the reason it failed.
+   *
+   * Never rethrows: a dead-letter write that fails must not take down queue
+   * processing for every message behind it. It is logged at `error` so the
+   * loss is still visible.
+   */
+  private async deadLetter(email: QueuedEmail, error: unknown): Promise<void> {
+    const failure =
+      error instanceof EmailDeliveryFailure
+        ? error
+        : new EmailDeliveryFailure(DeadLetterReason.PERMANENT, 1, error);
+
+    this.counters.deadLettered += 1;
+
+    try {
+      await this.deadLetterRepository.save(
+        this.deadLetterRepository.create({
+          message_id: email.id,
+          recipient: email.to,
+          subject: email.subject,
+          body_html: email.html,
+          body_text: email.text,
+          user_address: email.userAddress ?? null,
+          reason: failure.reason,
+          failure_message: failure.message.slice(0, MAX_FAILURE_MESSAGE_LENGTH),
+          attempts: failure.attempts,
+          queued_at: new Date(email.queuedAt),
+        }),
+      );
+      this.logger.error(
+        `Dead-lettered email ${email.id} to ${email.to} after ` +
+          `${failure.attempts} attempt(s) (${failure.reason}): ${failure.message} — ` +
+          `counters sent=${this.counters.sent} retried=${this.counters.retried} ` +
+          `deadLettered=${this.counters.deadLettered}`,
+      );
+    } catch (persistError) {
+      this.logger.error(
+        `Failed to dead-letter email ${email.id}; the message is lost: ` +
+          `${persistError instanceof Error ? persistError.message : String(persistError)}`,
+      );
+    }
   }
 
   private async deliverEmail(email: QueuedEmail): Promise<void> {
