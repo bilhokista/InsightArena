@@ -11,6 +11,10 @@ import {
 import { User } from '../users/entities/user.entity';
 import { UserPreferences } from '../users/entities/user-preferences.entity';
 import { NotificationCategoryPreference } from './entities/notification-category-preference.entity';
+import {
+  DeadLetteredEmail,
+  DeadLetterReason,
+} from './entities/dead-lettered-email.entity';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -156,6 +160,12 @@ describe('EmailService — deliverEmailWithRetry', () => {
   let preferencesRepository: jest.Mocked<
     Pick<import('typeorm').Repository<UserPreferences>, 'findOne'>
   >;
+  /** `create` passes the object straight through, so `save` receives the row
+   *  the service built and tests can assert on it directly. */
+  let deadLetterRepository: {
+    create: jest.Mock;
+    save: jest.Mock;
+  };
   let configGetMock: jest.Mock;
 
   beforeEach(async () => {
@@ -163,6 +173,10 @@ describe('EmailService — deliverEmailWithRetry', () => {
 
     userRepository = { findOne: jest.fn() };
     preferencesRepository = { findOne: jest.fn() };
+    deadLetterRepository = {
+      create: jest.fn((row: unknown) => row),
+      save: jest.fn((row: unknown) => Promise.resolve(row)),
+    };
 
     // Default config: 3 attempts, 1000 ms base delay
     configGetMock = jest.fn((key: string) => {
@@ -188,6 +202,10 @@ describe('EmailService — deliverEmailWithRetry', () => {
         {
           provide: getRepositoryToken(NotificationCategoryPreference),
           useValue: { findOne: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(DeadLetteredEmail),
+          useValue: deadLetterRepository,
         },
       ],
     }).compile();
@@ -351,10 +369,20 @@ describe('EmailService — queueing and preferences', () => {
   let preferencesRepository: jest.Mocked<
     Pick<import('typeorm').Repository<UserPreferences>, 'findOne'>
   >;
+  /** `create` passes the object straight through, so `save` receives the row
+   *  the service built and tests can assert on it directly. */
+  let deadLetterRepository: {
+    create: jest.Mock;
+    save: jest.Mock;
+  };
 
   beforeEach(async () => {
     userRepository = { findOne: jest.fn() };
     preferencesRepository = { findOne: jest.fn() };
+    deadLetterRepository = {
+      create: jest.fn((row: unknown) => row),
+      save: jest.fn((row: unknown) => Promise.resolve(row)),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -373,6 +401,10 @@ describe('EmailService — queueing and preferences', () => {
         {
           provide: getRepositoryToken(NotificationCategoryPreference),
           useValue: { findOne: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(DeadLetteredEmail),
+          useValue: deadLetterRepository,
         },
       ],
     }).compile();
@@ -449,5 +481,172 @@ describe('EmailService — queueing and preferences', () => {
     await expect(
       service.sendTemplatedEmail('user@example.com', 'event_created', {}),
     ).rejects.toThrow(/Missing required email template variables/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dead-letter queue: what happens to a message the provider will not accept
+// ---------------------------------------------------------------------------
+
+describe('EmailService — dead-letter queue', () => {
+  let service: EmailService;
+  let deadLetterRepository: { create: jest.Mock; save: jest.Mock };
+
+  /** Runs the queue timer far enough to cover three attempts and both backoffs. */
+  const drainQueue = () => jest.advanceTimersByTimeAsync(30_000);
+
+  const spyOnDeliver = () =>
+    jest.spyOn(
+      service as unknown as {
+        deliverEmail: (e: QueuedEmail) => Promise<void>;
+      },
+      'deliverEmail',
+    );
+
+  beforeEach(async () => {
+    jest.useFakeTimers();
+
+    deadLetterRepository = {
+      create: jest.fn((row: unknown) => row),
+      save: jest.fn((row: unknown) => Promise.resolve(row)),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        EmailService,
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              if (key === 'EMAIL_RETRY_MAX_ATTEMPTS') return '3';
+              if (key === 'EMAIL_RETRY_BASE_DELAY_MS') return '1000';
+              if (key === 'SENDGRID_API_KEY') return 'test-api-key';
+              return undefined;
+            }),
+          },
+        },
+        { provide: getRepositoryToken(User), useValue: { findOne: jest.fn() } },
+        {
+          provide: getRepositoryToken(UserPreferences),
+          useValue: { findOne: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(NotificationCategoryPreference),
+          useValue: { findOne: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(DeadLetteredEmail),
+          useValue: deadLetterRepository,
+        },
+      ],
+    }).compile();
+
+    service = module.get<EmailService>(EmailService);
+    service.onModuleInit();
+  });
+
+  afterEach(() => {
+    service.onModuleDestroy();
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  async function queueOne(): Promise<void> {
+    await service.queueEmail({
+      to: 'recipient@example.com',
+      subject: 'Test Subject',
+      html: '<p>Hello</p>',
+      text: 'Hello',
+    });
+  }
+
+  it('retries a transient failure and does not dead-letter once it succeeds', async () => {
+    const deliver = spyOnDeliver()
+      .mockRejectedValueOnce(new Error('SendGrid error (503): Service Unavailable'))
+      .mockResolvedValueOnce(undefined);
+
+    await queueOne();
+    await drainQueue();
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deadLetterRepository.save).not.toHaveBeenCalled();
+    expect(service.getDeliveryCounters()).toEqual({
+      sent: 1,
+      retried: 1,
+      deadLettered: 0,
+    });
+  });
+
+  it('dead-letters a permanently rejected message without retrying it', async () => {
+    const deliver = spyOnDeliver().mockRejectedValue(
+      new Error('SendGrid error (400): Bad Request'),
+    );
+
+    await queueOne();
+    await drainQueue();
+
+    // 4xx is a verdict, not a hiccup — one attempt only.
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deadLetterRepository.save).toHaveBeenCalledTimes(1);
+
+    const row = deadLetterRepository.save.mock.calls[0][0];
+    expect(row).toEqual(
+      expect.objectContaining({
+        recipient: 'recipient@example.com',
+        subject: 'Test Subject',
+        body_text: 'Hello',
+        reason: DeadLetterReason.PERMANENT,
+        attempts: 1,
+      }),
+    );
+    expect(row.failure_message).toContain('400');
+    expect(service.getDeliveryCounters()).toEqual({
+      sent: 0,
+      retried: 0,
+      deadLettered: 1,
+    });
+  });
+
+  it('dead-letters as retries_exhausted once the attempt budget runs out', async () => {
+    const deliver = spyOnDeliver().mockRejectedValue(
+      new Error('SendGrid error (503): Service Unavailable'),
+    );
+
+    await queueOne();
+    await drainQueue();
+
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(deadLetterRepository.save).toHaveBeenCalledTimes(1);
+    expect(deadLetterRepository.save.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        reason: DeadLetterReason.RETRIES_EXHAUSTED,
+        attempts: 3,
+      }),
+    );
+    // Two retries for three attempts.
+    expect(service.getDeliveryCounters()).toEqual({
+      sent: 0,
+      retried: 2,
+      deadLettered: 1,
+    });
+  });
+
+  it('keeps processing when the dead-letter write itself fails', async () => {
+    spyOnDeliver().mockRejectedValue(
+      new Error('SendGrid error (400): Bad Request'),
+    );
+    deadLetterRepository.save.mockRejectedValue(new Error('db unavailable'));
+
+    await queueOne();
+
+    // The failed write must not escape processQueue and kill the timer.
+    await expect(drainQueue()).resolves.toBeUndefined();
+    expect(service.getQueueLength()).toBe(0);
+  });
+
+  it('hands out a copy of the counters, not the live object', () => {
+    const counters = service.getDeliveryCounters();
+    counters.sent = 999;
+    expect(service.getDeliveryCounters().sent).toBe(0);
   });
 });
