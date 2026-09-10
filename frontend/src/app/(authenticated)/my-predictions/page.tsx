@@ -1,14 +1,24 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ChevronLeft, ChevronRight, BarChart3 } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { ChevronLeft, ChevronRight, BarChart3, Search } from "lucide-react";
 import { useConfirm } from "@/hooks/useConfirm";
 import { useToast } from "@/hooks/useToast";
 import { EmptyState } from "@/component/ui/empty-state";
-
-type PredictionStatus = "Active" | "Won" | "Lost" | "Pending";
-type FilterTab = "All" | "Active" | "Won" | "Lost" | "Pending";
+import {
+  DEFAULT_FILTERS,
+  FILTER_TABS,
+  type FilterTab,
+  type PredictionFilters,
+  type PredictionStatus,
+  buildFilterQuery,
+  filterPredictions,
+  formatSignedAmount,
+  readFiltersFromParams,
+  summarisePredictions,
+} from "@/lib/predictions";
 
 interface Prediction {
   id: string;
@@ -127,6 +137,8 @@ function getStatusBadgeClasses(status: PredictionStatus): string {
       return `${baseClasses} border border-red-500/30 bg-red-500/10 text-red-200`;
     case "Pending":
       return `${baseClasses} border border-yellow-500/30 bg-yellow-500/10 text-yellow-200`;
+    case "Refunded":
+      return `${baseClasses} border border-slate-500/30 bg-slate-500/10 text-slate-200`;
     default:
       return `${baseClasses} border border-white/10 bg-white/5 text-gray-200`;
   }
@@ -151,19 +163,42 @@ function getCategoryBadgeClasses(category: string): string {
   }
 }
 
-export default function MyPredictionsPage() {
+/**
+ * `useSearchParams` opts the whole subtree into client-side rendering, and
+ * Next refuses to build a page that calls it outside a Suspense boundary. The
+ * page component below supplies one; this holds the actual screen.
+ */
+function MyPredictionsContent() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
   const [predictions, setPredictions] = useState<Prediction[]>(MOCK_PREDICTIONS);
-  const [activeFilter, setActiveFilter] = useState<FilterTab>("All");
+  const [filters, setFilters] = useState<PredictionFilters>(() =>
+    readFiltersFromParams(new URLSearchParams(searchParams.toString())),
+  );
   const [currentPage, setCurrentPage] = useState(1);
   const [claimingPredictionId, setClaimingPredictionId] = useState<string | null>(null);
   const [claimError, setClaimError] = useState<string | null>(null);
   const confirm = useConfirm();
   const toast = useToast();
 
-  const filteredPredictions = useMemo(() => {
-    if (activeFilter === "All") return predictions;
-    return predictions.filter((pred) => pred.status === activeFilter);
-  }, [predictions, activeFilter]);
+  const filteredPredictions = useMemo(
+    () => filterPredictions(predictions, filters),
+    [predictions, filters],
+  );
+
+  // Write the filters back to the URL so the view survives a reload and can be
+  // shared as a link. `replace` rather than `push`: typing in the search box
+  // should not bury the previous page under a stack of history entries.
+  useEffect(() => {
+    const query = buildFilterQuery(filters);
+    const next = query ? `${pathname}?${query}` : pathname;
+    const current = searchParams.toString();
+    if (query !== current) {
+      router.replace(next, { scroll: false });
+    }
+  }, [filters, pathname, router, searchParams]);
 
   const totalPages = Math.ceil(filteredPredictions.length / ITEMS_PER_PAGE);
   const paginatedPredictions = useMemo(() => {
@@ -171,37 +206,47 @@ export default function MyPredictionsPage() {
     return filteredPredictions.slice(startIndex, startIndex + ITEMS_PER_PAGE);
   }, [filteredPredictions, currentPage]);
 
-  const stats = useMemo(() => {
-    const total = predictions.length;
-    const won = predictions.filter((p) => p.status === "Won").length;
-    const lost = predictions.filter((p) => p.status === "Lost").length;
-    const pending = predictions.filter((p) => p.status === "Pending").length;
+  // Summarises the *filtered* set, so the chips answer "how am I doing in
+  // what I am looking at" rather than always restating the lifetime totals.
+  const stats = useMemo(
+    () => summarisePredictions(filteredPredictions),
+    [filteredPredictions],
+  );
 
-    return {
-      total,
-      won,
-      lost,
-      pending,
-      wonPercentage: total > 0 ? Math.round((won / total) * 100) : 0,
-      lostPercentage: total > 0 ? Math.round((lost / total) * 100) : 0,
-      pendingPercentage: total > 0 ? Math.round((pending / total) * 100) : 0,
-    };
-  }, [predictions]);
-
+  // Counts on the tabs respect the search box but not the status filter —
+  // otherwise every tab except the active one would read zero.
   const filterCounts = useMemo(() => {
+    const searchOnly = filterPredictions(predictions, {
+      ...filters,
+      status: "All",
+    });
     return {
-      All: predictions.length,
-      Active: predictions.filter((p) => p.status === "Active").length,
-      Won: predictions.filter((p) => p.status === "Won").length,
-      Lost: predictions.filter((p) => p.status === "Lost").length,
-      Pending: predictions.filter((p) => p.status === "Pending").length,
-    };
-  }, [predictions]);
+      All: searchOnly.length,
+      Active: searchOnly.filter((p) => p.status === "Active").length,
+      Pending: searchOnly.filter((p) => p.status === "Pending").length,
+      Won: searchOnly.filter((p) => p.status === "Won").length,
+      Lost: searchOnly.filter((p) => p.status === "Lost").length,
+      Refunded: searchOnly.filter((p) => p.status === "Refunded").length,
+    } satisfies Record<FilterTab, number>;
+  }, [predictions, filters]);
 
-  const handleFilterChange = (filter: FilterTab) => {
-    setActiveFilter(filter);
+  const handleFilterChange = useCallback((status: FilterTab) => {
+    setFilters((prev) => ({ ...prev, status }));
     setCurrentPage(1);
-  };
+  }, []);
+
+  const handleSearchChange = useCallback((search: string) => {
+    setFilters((prev) => ({ ...prev, search }));
+    setCurrentPage(1);
+  }, []);
+
+  const handleClearFilters = useCallback(() => {
+    setFilters(DEFAULT_FILTERS);
+    setCurrentPage(1);
+  }, []);
+
+  const hasActiveFilters =
+    filters.status !== DEFAULT_FILTERS.status || filters.search.trim() !== "";
 
   const handleClaimPayout = async (predictionId: string) => {
     const targetPrediction = predictions.find((prediction) => prediction.id === predictionId);
@@ -244,7 +289,13 @@ export default function MyPredictionsPage() {
       variant: "destructive",
     });
     if (!confirmed) return;
-    setPredictions((prev) => prev.filter((p) => p.id !== prediction.id));
+    // Marked rather than removed: a refund is part of the history the user
+    // came here to review, and deleting the row hid it entirely.
+    setPredictions((prev) =>
+      prev.map((p) =>
+        p.id === prediction.id ? { ...p, status: "Refunded" as const } : p,
+      ),
+    );
     toast.success("Prediction cancelled and stake refunded");
   };
 
@@ -258,55 +309,96 @@ export default function MyPredictionsPage() {
 
   return (
     <div className="space-y-6 p-4 sm:p-6">
-      {/* Summary Stats Row */}
-      <section className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
+      {/* Summary Stats Row — reflects the filtered set, not lifetime totals. */}
+      <section
+        className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4"
+        aria-label="Summary of the predictions shown"
+      >
         <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
           <h3 className="text-sm font-medium text-white/90">
-            Total Predictions
+            {hasActiveFilters ? "Predictions Shown" : "Total Predictions"}
           </h3>
-          <p className="mt-3 text-3xl font-bold text-white">{stats.total}</p>
+          <p className="mt-3 text-3xl font-bold text-white" data-testid="summary-total">
+            {stats.total}
+          </p>
         </div>
         <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-          <h3 className="text-sm font-medium text-white/90">Won</h3>
+          <h3 className="text-sm font-medium text-white/90">Win Rate</h3>
           <div className="mt-3 flex items-baseline gap-2">
-            <p className="text-3xl font-bold text-emerald-300">{stats.won}</p>
-            <span className="text-sm text-emerald-400">
-              ({stats.wonPercentage}%)
-            </span>
-          </div>
-        </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-          <h3 className="text-sm font-medium text-white/90">Lost</h3>
-          <div className="mt-3 flex items-baseline gap-2">
-            <p className="text-3xl font-bold text-red-300">{stats.lost}</p>
-            <span className="text-sm text-red-400">
-              ({stats.lostPercentage}%)
-            </span>
-          </div>
-        </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-          <h3 className="text-sm font-medium text-white/90">Pending</h3>
-          <div className="mt-3 flex items-baseline gap-2">
-            <p className="text-3xl font-bold text-yellow-300">
-              {stats.pending}
+            <p className="text-3xl font-bold text-emerald-300" data-testid="summary-win-rate">
+              {stats.winRate === null ? "—" : `${stats.winRate}%`}
             </p>
-            <span className="text-sm text-yellow-400">
-              ({stats.pendingPercentage}%)
+            <span className="text-sm text-white/50">
+              {stats.decided === 0
+                ? "nothing settled yet"
+                : `${stats.won} of ${stats.decided} settled`}
             </span>
+          </div>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
+          <h3 className="text-sm font-medium text-white/90">Net P/L</h3>
+          <p
+            className={`mt-3 text-3xl font-bold ${
+              stats.netPnl > 0
+                ? "text-emerald-300"
+                : stats.netPnl < 0
+                  ? "text-red-300"
+                  : "text-white"
+            }`}
+            data-testid="summary-net-pnl"
+          >
+            {formatSignedAmount(stats.netPnl)} XLM
+          </p>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
+          <h3 className="text-sm font-medium text-white/90">Open</h3>
+          <div className="mt-3 flex items-baseline gap-2">
+            <p className="text-3xl font-bold text-yellow-300" data-testid="summary-open">
+              {stats.active + stats.pending}
+            </p>
+            <span className="text-sm text-yellow-400">still running</span>
           </div>
         </div>
       </section>
 
       {/* Filter Tabs */}
       <section className="rounded-2xl border border-white/10 bg-white/5 p-6">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="relative flex-1">
+            <Search
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/40"
+              aria-hidden="true"
+            />
+            <input
+              type="search"
+              id="prediction-search"
+              value={filters.search}
+              onChange={(event) => handleSearchChange(event.target.value)}
+              placeholder="Search by market title"
+              aria-label="Search predictions by market title"
+              className="w-full rounded-xl border border-white/10 bg-white/5 py-2 pl-9 pr-3 text-sm text-white placeholder:text-white/40 focus:border-orange-500/50 focus:outline-none"
+            />
+          </div>
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={handleClearFilters}
+              className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-gray-200 hover:bg-white/10"
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+
         <div className="flex flex-wrap gap-2">
-          {(["All", "Active", "Won", "Lost", "Pending"] as FilterTab[]).map(
+          {FILTER_TABS.map(
             (filter) => (
               <button
                 key={filter}
                 onClick={() => handleFilterChange(filter)}
+                aria-pressed={filters.status === filter}
                 className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
-                  activeFilter === filter
+                  filters.status === filter
                     ? "bg-orange-500 text-white"
                     : "border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10"
                 }`}
@@ -314,7 +406,7 @@ export default function MyPredictionsPage() {
                 {filter}
                 <span
                   className={`inline-flex h-5 min-w-[20px] items-center justify-center rounded-full px-1.5 text-xs font-bold ${
-                    activeFilter === filter
+                    filters.status === filter
                       ? "bg-white/20 text-white"
                       : "bg-white/10 text-gray-300"
                   }`}
@@ -342,13 +434,25 @@ export default function MyPredictionsPage() {
         {paginatedPredictions.length === 0 ? (
           <EmptyState
             icon={<BarChart3 className="h-7 w-7" />}
-            title="No predictions found"
-            description={
-              activeFilter === "All"
-                ? "You haven't made any predictions yet. Start by browsing available markets."
-                : `You don't have any ${activeFilter.toLowerCase()} predictions.`
+            title={
+              hasActiveFilters ? "No matching predictions" : "No predictions found"
             }
-            action={{ label: "Browse Markets", href: "/markets" }}
+            description={
+              // Telling someone to go and place a bet when they have eight of
+              // them and simply mistyped a search is the failure to avoid.
+              filters.search.trim()
+                ? `Nothing matches "${filters.search.trim()}"${
+                    filters.status === "All" ? "" : ` in ${filters.status.toLowerCase()}`
+                  }.`
+                : hasActiveFilters
+                  ? `You don't have any ${filters.status.toLowerCase()} predictions.`
+                  : "You haven't made any predictions yet. Start by browsing available markets."
+            }
+            action={
+              hasActiveFilters
+                ? { label: "Clear filters", onClick: handleClearFilters }
+                : { label: "Browse Markets", href: "/markets" }
+            }
           />
         ) : (
           <div className="space-y-4">
@@ -467,5 +571,21 @@ export default function MyPredictionsPage() {
         )}
       </section>
     </div>
+  );
+}
+
+export default function MyPredictionsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="space-y-6 p-4 sm:p-6" aria-busy="true">
+          <p className="text-sm text-white/60" role="status">
+            Loading your predictions…
+          </p>
+        </div>
+      }
+    >
+      <MyPredictionsContent />
+    </Suspense>
   );
 }
