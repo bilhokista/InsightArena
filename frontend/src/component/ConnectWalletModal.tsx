@@ -3,14 +3,13 @@
 import { useEffect, useState } from "react";
 import { X, Check, AlertCircle, ExternalLink } from "lucide-react";
 
-type ModalStep = "idle" | "connecting" | "success" | "error";
+import {
+  type WalletErrorInfo,
+  classifyWalletError,
+  withWalletTimeout,
+} from "@/lib/wallet-errors";
 
-type ErrorType =
-  | "not_installed"
-  | "locked"
-  | "user_rejected"
-  | "wrong_network"
-  | "connection_failed";
+type ModalStep = "idle" | "connecting" | "success" | "error";
 
 interface ConnectWalletModalProps {
   isOpen: boolean;
@@ -33,8 +32,7 @@ export default function ConnectWalletModal({
 }: ConnectWalletModalProps) {
   const [step, setStep] = useState<ModalStep>("idle");
   const [wallets, setWallets] = useState<WalletOption[]>([]);
-  const [error, setError] = useState("");
-  const [errorType, setErrorType] = useState<ErrorType | null>(null);
+  const [errorInfo, setErrorInfo] = useState<WalletErrorInfo | null>(null);
   const [connectedAddress, setConnectedAddress] = useState("");
   const [expandedFaq, setExpandedFaq] = useState(false);
   const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
@@ -88,8 +86,7 @@ export default function ConnectWalletModal({
 
   const resetModal = () => {
     setStep("idle");
-    setError("");
-    setErrorType(null);
+    setErrorInfo(null);
     setConnectedAddress("");
     setSelectedWalletId(null);
   };
@@ -102,15 +99,18 @@ export default function ConnectWalletModal({
   const handleWalletSelect = async (walletId: string) => {
     setStep("connecting");
     setSelectedWalletId(walletId);
-    setError("");
-    setErrorType(null);
+    setErrorInfo(null);
 
     try {
       const { StellarWalletsKit } =
         await import("@creit-tech/stellar-wallets-kit/sdk");
 
       StellarWalletsKit.setWallet(walletId);
-      const { address } = await StellarWalletsKit.fetchAddress();
+      // An extension that never answers used to leave this modal on
+      // "connecting" with no way out except closing it.
+      const { address } = await withWalletTimeout(
+        StellarWalletsKit.fetchAddress(),
+      );
 
       setConnectedAddress(address);
       setStep("success");
@@ -120,29 +120,13 @@ export default function ConnectWalletModal({
         onSuccess(address, walletId);
       }, 1200);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+      const walletName =
+        wallets.find((w) => w.id === walletId)?.name ?? "Your wallet";
 
-      // Categorize errors
-      if (msg.includes("cancel") || msg.includes("reject") || msg.includes("user closed") || msg.includes("denied")) {
-        // User rejected - reset to idle to let them try again
-        resetModal();
-        return;
-      }
-
-      if (msg.includes("not installed") || msg.includes("not available")) {
-        setErrorType("not_installed");
-        setError("Wallet extension is not installed");
-      } else if (msg.includes("locked")) {
-        setErrorType("locked");
-        setError("Wallet is locked. Please unlock it and try again.");
-      } else if (msg.includes("network") || msg.includes("testnet") || msg.includes("public")) {
-        setErrorType("wrong_network");
-        setError("Please switch to the Stellar Public network in your wallet");
-      } else {
-        setErrorType("connection_failed");
-        setError(err instanceof Error ? err.message : "Connection failed. Please try again.");
-      }
-
+      // A declined request used to call resetModal() and return, dropping the
+      // user back at the wallet list with no explanation at all. It is now a
+      // first-class state like any other failure.
+      setErrorInfo(classifyWalletError(err, walletName));
       setStep("error");
     }
   };
@@ -294,39 +278,38 @@ export default function ConnectWalletModal({
         )}
 
         {/* Error */}
-        {step === "error" && (
-          <div className="space-y-6">
+        {step === "error" && errorInfo && (
+          <div className="space-y-6" role="alert" data-testid="wallet-error">
             <div className="text-center">
               <div className="flex justify-center mb-4">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-500/10">
                   <AlertCircle className="h-6 w-6 text-red-400" />
                 </div>
               </div>
-              <h3 className="text-lg font-semibold text-white">
-                {errorType === "not_installed"
-                  ? "Wallet Not Installed"
-                  : errorType === "locked"
-                    ? "Wallet Locked"
-                    : errorType === "wrong_network"
-                      ? "Wrong Network"
-                      : "Connection Failed"}
+              <h3
+                className="text-lg font-semibold text-white"
+                data-testid="wallet-error-title"
+              >
+                {errorInfo.title}
               </h3>
-              <p className="mt-2 text-sm text-[#9aa4bc]">{error}</p>
+              <p
+                className="mt-2 text-sm text-[#9aa4bc]"
+                data-testid="wallet-error-message"
+              >
+                {errorInfo.message}
+              </p>
 
-              {errorType === "locked" && (
-                <p className="mt-3 text-xs text-[#4FD1C5]">
-                  Unlock your wallet extension and click retry
-                </p>
-              )}
-
-              {errorType === "wrong_network" && (
-                <p className="mt-3 text-xs text-[#4FD1C5]">
-                  Open your wallet extension and switch to the Stellar Public network
+              {errorInfo.hint && (
+                <p
+                  className="mt-3 text-xs text-[#4FD1C5]"
+                  data-testid="wallet-error-hint"
+                >
+                  {errorInfo.hint}
                 </p>
               )}
             </div>
             <div className="flex gap-3">
-              {errorType === "not_installed" ? (
+              {!errorInfo.canRetry ? (
                 <>
                   <button
                     onClick={resetModal}
