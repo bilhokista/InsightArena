@@ -15,6 +15,14 @@ export const env = {
   STELLAR_EXPLORER_URL:
     process.env.NEXT_PUBLIC_STELLAR_EXPLORER_URL ?? "https://stellar.expert/explorer",
   STELLAR_NETWORK: process.env.NEXT_PUBLIC_STELLAR_NETWORK ?? "testnet",
+  /**
+   * Where "Report issue" sends the user. Defaults to this project's own
+   * tracker; a deployment with its own support desk can point it elsewhere,
+   * including at a `mailto:` address.
+   */
+  ERROR_REPORT_URL:
+    process.env.NEXT_PUBLIC_ERROR_REPORT_URL ??
+    "https://github.com/Arena1X/InsightArena/issues/new",
 };
 
 export function getStellarExplorerUrl(
